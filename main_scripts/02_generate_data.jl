@@ -22,7 +22,7 @@ tspan = (0.0, 10.0)
 
 # Generate and save a dataset of 10 trajectories
 dataset = []
-for i in 1:10
+for i in 1:100
     # Perturb initial positions slightly for variety
     u0_perturbed = u0 .+ 0.1 * randn(length(u0))
     t, data = generate_trajectory(u0_perturbed, tspan, p, noise_level=0.02)
