@@ -1,7 +1,15 @@
-# scripts/03_train_neural_ode.jl
-
 using ComponentArrays, Lux, DiffEqFlux, OrdinaryDiffEq, Optimization,
-      OptimizationOptimisers, Random, JLD2
+      OptimizationOptimisers, Random, JLD2, LuxCUDA, Plots
+
+# =============================================================================
+# GPU SETUP
+# =============================================================================
+# Set up the GPU device. This will use the GPU if available.
+# If no GPU is available, it will default to the CPU.
+const gdev = gpu_device(1)
+const cdev = cpu_device()
+println("Training will run on: ", gdev)
+# =============================================================================
 
 # Load the training data using a robust path
 dataset = load(joinpath(@__DIR__, "..", "data", "nbody_dataset.jld2"), "dataset")
@@ -9,57 +17,62 @@ dataset = load(joinpath(@__DIR__, "..", "data", "nbody_dataset.jld2"), "dataset"
 # =============================================================================
 # HYPERPARAMETERS - Easy to modify
 # =============================================================================
-num_trajectories = 5        # Number of trajectories to use for training
-learning_rate = 0.001        # Optimizer step size
-max_iterations = 100        # Number of training iterations
-activation_function = tanh  # Activation function (tanh, relu, sigmoid, etc.)
+num_trajectories = 1      # Number of trajectories to use for training
+learning_rate = 0.001     # Optimizer step size
+max_iterations = 10000    # Number of training iterations
+activation_function = tanh # Activation function (tanh, relu, sigmoid, etc.)
 # =============================================================================
 
 # Use first trajectory as reference for setup
 t_ref = Float32.(dataset[1].t)
-u0_ref = Float32.(dataset[1].u0)
+u0_ref = Float32.(dataset[1].u0) # This remains on the CPU for reference
 
 # 1. Define the neural network using Lux.jl
 rng = Random.default_rng()
-# dudt_nn = Lux.Chain(Lux.Dense(length(u0_ref), 64, activation_function),
-#                     Lux.Dense(64, 64, activation_function),
-#                     Lux.Dense(64, length(u0_ref)))
-
 # Bigger network
 dudt_nn = Lux.Chain(Lux.Dense(length(u0_ref), 128, activation_function),
-                    Lux.Dense(128, 128, activation_function),
-                    Lux.Dense(128, 64, activation_function),
-                    Lux.Dense(64, length(u0_ref)))
+                      Lux.Dense(128, 128, activation_function),
+                      Lux.Dense(128, 64, activation_function),
+                      Lux.Dense(64, length(u0_ref)))
 
-# 2. Initialize the parameters (ps) and state (st) for the Lux model
+# 2. Initialize the parameters (ps) and state (st) and move them to the GPU
 p, st = Lux.setup(rng, dudt_nn)
-ps = ComponentArray(p) # Wrap parameters in a ComponentArray
+ps = ComponentArray(p) |> gdev # Move initial parameters to the GPU
+st = st |> gdev                 # Move state to the GPU
 
 # 3. Define the Neural ODE
+# The solver will run on the GPU as long as u0 and p are on the GPU
 prob_neuralode = NeuralODE(dudt_nn, (t_ref[1], t_ref[end]), Tsit5();
                            saveat = t_ref)
 
-# 4. Define the prediction function
+# 4. Define the prediction function for validation/plotting
 function predict_neuralode(p)
-    # Pass initial condition, parameters, and state to the NeuralODE problem
-    Array(prob_neuralode(u0_ref, p, st)[1])
+    # Move the reference initial condition to the GPU for this prediction
+    u0_gpu = u0_ref |> gdev
+    # The prediction runs on the GPU
+    pred_gpu = prob_neuralode(u0_gpu, p, st)[1]
+    # Move the result back to the CPU for plotting
+    return Array(pred_gpu)
 end
 
 # 5. Define the loss function - MUST return only scalar loss
-function loss_neuralode(p) # p = current NN parameters
-    total_loss = 0.0
+function loss_neuralode(p) # p = current NN parameters (on GPU)
+    total_loss = 0.0f0
     for trajectory in dataset[1:num_trajectories]
-        u0_traj = Float32.(trajectory.u0)
-        data_traj = Float32.(trajectory.data)
-        # Create temporary NeuralODE for this trajectory's initial condition
-        pred = Array(prob_neuralode(u0_traj, p, st)[1])
+        # Move the trajectory's initial condition and data to the GPU
+        u0_traj = Float32.(trajectory.u0) |> gdev
+        data_traj = Float32.(trajectory.data) |> gdev
+
+        # The prediction is computed on the GPU
+        pred = Array(prob_neuralode(u0_traj, p, st)[1]) 
+
+        # The loss is calculated on the GPU, resulting in a scalar
         total_loss += sum(abs2, data_traj .- pred)
     end
-    return total_loss / num_trajectories  # Average loss over selected trajectories
+    return total_loss / num_trajectories # Average loss
 end
 
 # 6. Set up the callback function to monitor training
-# We'll compute predictions inside the callback for monitoring
 callback = function (p, l)
     println("Loss: ", l)
     # Return false to continue training
@@ -67,35 +80,38 @@ callback = function (p, l)
 end
 
 # 7. Use Optimization.jl to set up and run the training
-adtype = Optimization.AutoZygote() # Automatic differentiation backend that computes gradients of your loss function
+adtype = Optimization.AutoZygote()
 optf = Optimization.OptimizationFunction((x, p) -> loss_neuralode(x), adtype)
-# Wraps your loss_neuralode function so the optimizer can minimize it
+# The parameters `ps` are already on the GPU
 optprob = Optimization.OptimizationProblem(optf, ps)
-# Defines what to optimize (the loss) and what parameters to adjust (ps)
 
 println("Starting training for the Neural ODE...")
 result_neuralode = Optimization.solve(optprob,
-                                        OptimizationOptimisers.Adam(learning_rate);
-                                        callback = callback,
-                                        maxiters = max_iterations)
+                                       OptimizationOptimisers.Adam(learning_rate);
+                                       callback = callback,
+                                       maxiters = max_iterations)
 println("Training complete.")
 
-# The optimized parameters are in result_neuralode.u
-ps_trained = result_neuralode.u
+# The optimized parameters are on the GPU
+ps_trained_gpu = result_neuralode.u
+
+# Move the trained parameters and state back to the CPU for saving
+ps_trained_cpu = ps_trained_gpu |> cdev
+st_cpu = st |> cdev
 
 # Save the trained parameters
-jldsave(joinpath(@__DIR__, "..", "data", "trained_neural_ode.jld2"); 
-        ps_trained, st, dudt_nn)
+jldsave(joinpath(@__DIR__, "..", "data", "trained_neural_ode.jld2");
+        ps_trained = ps_trained_cpu, st = st_cpu, dudt_nn)
 println("Saved trained Neural ODE parameters to data/trained_neural_ode.jld2")
 
 # Optional: Plot comparison between true and predicted trajectories
-using Plots
-pred_final = predict_neuralode(ps_trained)
+# The predict_neuralode function already moves the result to the CPU
+pred_final = predict_neuralode(ps_trained_gpu)
 
 # Plot all variables (using first trajectory)
-data_plot = Float32.(dataset[1].data)
+data_plot = Float32.(dataset[1].data) # This data is on the CPU
 
-# Create 2x3 subplot layout with appropriate aspect ratio
+# Create 2x3 subplot layout
 plots_array = []
 
 # Position plots (top row)
@@ -128,10 +144,10 @@ for body in 1:3
     push!(plots_array, p_vel)
 end
 
-# Combine all plots with appropriate aspect ratio
-p_combined = plot(plots_array..., layout=(2,3), size=(1200, 800), 
+# Combine all plots
+p_combined = plot(plots_array..., layout=(2,3), size=(1200, 800),
                   plot_title="Neural ODE Training Results - All Variables")
 
 # Save the plot
-savefig(p_combined, joinpath(@__DIR__, "..", "plots", "neural_ode_training_results.png"))
+savefig(p_combined, joinpath(@__DIR__, "..", "plots", "neural_ode_training_results_gpu.png"))
 display(p_combined)
